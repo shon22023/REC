@@ -319,7 +319,7 @@ app.delete("/clear", (req, res) => {
 
 // 25分おきに再生候補を更新
 // テストの為２分に変更！
-cron.schedule("*/2 * * * *", () => {
+cron.schedule("*/5 * * * *", () => {
   console.log("=== 2分おきスキャン実行 ===");
   updateMixCandidates();
 });
@@ -336,7 +336,7 @@ app.listen(PORT, () => {
   console.log(`📁 upVoice ディレクトリ: ${UPVOICE_DIR}`);
   console.log(`📊 ファイル上限: ${MAX_FILES}件`);
   console.log(`🔀 ミックス対象: 最大${MIX_CANDIDATE_COUNT}件`);
-  console.log("====テストの為２分おきに再生=======");
+  console.log("====テストの為5分おきに再生=======");
   
   // 起動時に候補を更新
   updateMixCandidates();
