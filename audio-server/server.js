@@ -226,6 +226,9 @@ app.get("/mix", async (req, res) => {
 
   // 複数ファイルをミックス
   isMixing = true;
+  
+  // stderrをバッファに保存（エラー時に出力するため）
+  let stderrBuffer = '';
 
   try {
     // FFmpeg amix コマンド構築
@@ -250,16 +253,38 @@ app.get("/mix", async (req, res) => {
 
     const ffmpeg = spawn("ffmpeg", ffmpegArgs);
 
+    // FFmpegのstderrをログに出力（エラー原因を確認するため）
+    ffmpeg.stderr.on("data", (data) => {
+      const message = data.toString();
+      stderrBuffer += message;
+      // エラーメッセージをログに出力
+      if (message.includes('Error') || message.includes('error') || message.includes('Invalid')) {
+        console.error(`FFmpeg stderr: ${message}`);
+      }
+    });
+
+    // ストリームのエラーハンドリング
+    ffmpeg.stdout.on("error", (err) => {
+      console.error("FFmpeg stdout エラー:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: "ストリームエラーが発生しました" });
+      } else {
+        res.destroy(); // 既にヘッダーが送られている場合はストリームを破棄
+      }
+      isMixing = false;
+    });
+
+    res.on("error", (err) => {
+      console.error("レスポンスストリームエラー:", err);
+      isMixing = false;
+    });
+
+    // ヘッダーを設定（パイプ前に設定）
     res.setHeader("Content-Type", "audio/webm");
     res.setHeader("Content-Disposition", "attachment; filename=mixed.webm");
 
     // FFmpeg stdout をレスポンスにパイプ
     ffmpeg.stdout.pipe(res);
-
-    ffmpeg.stderr.on("data", (data) => {
-      // FFmpeg のログ出力（デバッグ用）
-      // console.log(`FFmpeg: ${data}`);
-    });
 
     ffmpeg.on("close", (code) => {
       if (code === 0) {
@@ -268,15 +293,31 @@ app.get("/mix", async (req, res) => {
         clearAllUpVoiceFiles();
       } else {
         console.error(`FFmpeg 終了コード: ${code}`);
+        console.error(`FFmpeg stderr 全体:\n${stderrBuffer}`);
+        
+        // エラー時はレスポンスを適切に終了
+        if (!res.headersSent) {
+          res.status(500).json({ 
+            ok: false, 
+            error: `FFmpeg処理が失敗しました (終了コード: ${code})`,
+            details: stderrBuffer
+          });
+        } else {
+          // 既にヘッダーが送られている場合は、ストリームを破棄
+          res.destroy();
+        }
       }
       isMixing = false;
     });
 
     ffmpeg.on("error", (err) => {
       console.error("FFmpeg 実行エラー:", err);
+      console.error(`FFmpeg stderr 全体:\n${stderrBuffer}`);
       isMixing = false;
       if (!res.headersSent) {
         res.status(500).json({ ok: false, error: "FFmpeg 実行中にエラーが発生しました" });
+      } else {
+        res.destroy();
       }
     });
 
