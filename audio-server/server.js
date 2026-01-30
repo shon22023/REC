@@ -47,6 +47,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+
 // upVoice フォルダが存在しなければ作成
 if (!fs.existsSync(UPVOICE_DIR)) {
   fs.mkdirSync(UPVOICE_DIR, { recursive: true });
@@ -358,8 +359,9 @@ app.delete("/clear", (req, res) => {
 // ====== スケジュールタスク ======
 
 // 25分おきに再生候補を更新
-cron.schedule("*/25 * * * *", () => {
-  console.log("=== 25分おきスキャン実行 ===");
+// テストの為２分に変更！
+cron.schedule("*/5 * * * *", () => {
+  console.log("=== 2分おきスキャン実行 ===");
   updateMixCandidates();
 });
 
@@ -375,6 +377,7 @@ app.listen(PORT, () => {
   console.log(`📁 upVoice ディレクトリ: ${UPVOICE_DIR}`);
   console.log(`📊 ファイル上限: ${MAX_FILES}件`);
   console.log(`🔀 ミックス対象: 最大${MIX_CANDIDATE_COUNT}件`);
+  console.log("====テストの為5分おきに再生=======");
   
   // 起動時に候補を更新
   updateMixCandidates();
