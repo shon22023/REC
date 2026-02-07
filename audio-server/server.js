@@ -39,8 +39,11 @@ const __dirname = path.dirname(__filename);
 // ====== 設定 ======
 const PORT = process.env.PORT || 3000;
 const UPVOICE_DIR = path.join(__dirname, "upVoice");
+const MIXED_VOICE_DIR = path.join(__dirname, "mixedVoice");
 const MAX_FILES = 50;           // upVoice の上限ファイル数
 const MIX_CANDIDATE_COUNT = 10; // ミックス対象の最大ファイル数
+const MAX_MIXED_FILES = 2;      // 最新2つのミックス音声を保持
+const MIXED_FILE_LIFETIME = 30 * 60 * 1000; // 30分
 
 // ====== アプリ初期化 ======
 const app = express();
@@ -53,8 +56,12 @@ if (!fs.existsSync(UPVOICE_DIR)) {
   fs.mkdirSync(UPVOICE_DIR, { recursive: true });
 }
 
+// mixedVoice フォルダが存在しなければ作成
+if (!fs.existsSync(MIXED_VOICE_DIR)) {
+  fs.mkdirSync(MIXED_VOICE_DIR, { recursive: true });
+}
+
 // ====== 状態管理 ======
-let mixCandidates = [];       // 再生候補リスト
 let isMixing = false;         // FFmpeg amix 実行中フラグ（ロック機構）
 
 // ====== Multer 設定（時刻付きファイル名で保存） ======
@@ -138,17 +145,168 @@ function clearAllUpVoiceFiles() {
       console.error(`削除エラー: ${f.name}`, err);
     }
   });
-  mixCandidates = [];
   console.log(`upVoice 全削除完了 (${files.length}件)`);
 }
 
+
 /**
- * 再生候補を更新（古い順に最大10件）
+ * mixedVoice フォルダ内のファイル一覧を取得（新しい順にソート）
  */
-function updateMixCandidates() {
+function getMixedVoiceFiles() {
+  try {
+    const files = fs.readdirSync(MIXED_VOICE_DIR)
+      .filter(f => !f.startsWith(".")) // 隠しファイル除外
+      .map(f => ({
+        name: f,
+        path: path.join(MIXED_VOICE_DIR, f),
+        timestamp: parseInt(f.split("_")[1]) || 0
+      }))
+      .sort((a, b) => b.timestamp - a.timestamp); // 新しい順
+    return files;
+  } catch (error) {
+    console.error("mixedVoiceファイル一覧取得エラー:", error);
+    return [];
+  }
+}
+
+/**
+ * 古いミックス音声を削除（30分以上経過 or MAX_MIXED_FILES超過）
+ */
+function cleanupOldMixedFiles() {
+  const files = getMixedVoiceFiles();
+  const now = Date.now();
+  let deletedCount = 0;
+
+  files.forEach((f, index) => {
+    const age = now - f.timestamp;
+    
+    // 30分以上経過したファイルを削除
+    if (age > MIXED_FILE_LIFETIME) {
+      try {
+        fs.unlinkSync(f.path);
+        console.log(`期限切れミックス音声削除: ${f.name} (${Math.floor(age / 60000)}分経過)`);
+        deletedCount++;
+      } catch (err) {
+        console.error(`削除エラー: ${f.name}`, err);
+      }
+    }
+    // MAX_MIXED_FILES を超えた古いファイルも削除
+    else if (index >= MAX_MIXED_FILES) {
+      try {
+        fs.unlinkSync(f.path);
+        console.log(`上限超過ミックス音声削除: ${f.name}`);
+        deletedCount++;
+      } catch (err) {
+        console.error(`削除エラー: ${f.name}`, err);
+      }
+    }
+  });
+
+  if (deletedCount > 0) {
+    console.log(`ミックス音声クリーンアップ完了: ${deletedCount}件削除`);
+  }
+}
+
+/**
+ * upVoice内のファイルをamixしてmixedVoiceに保存
+ */
+async function performAutoMix() {
+  // ロック確認（同時実行防止）
+  if (isMixing) {
+    console.log("既にミックス処理中です。スキップします。");
+    return;
+  }
+
   const files = getUpVoiceFiles();
-  mixCandidates = files.slice(0, MIX_CANDIDATE_COUNT);
-  console.log(`再生候補更新: ${mixCandidates.length}件`);
+  
+  if (files.length === 0) {
+    console.log("ミックスする音声がありません。");
+    return;
+  }
+
+  isMixing = true;
+  const timestamp = Date.now();
+  const outputFilename = `mixed_${timestamp}.webm`;
+  const outputPath = path.join(MIXED_VOICE_DIR, outputFilename);
+
+  try {
+    console.log(`自動ミックス開始: ${files.length}件のファイルを処理`);
+
+    // ファイルが1つの場合はコピーするだけ
+    if (files.length === 1) {
+      fs.copyFileSync(files[0].path, outputPath);
+      console.log(`単一ファイルをコピー: ${outputFilename}`);
+      
+      // upVoice内のファイルを削除
+      clearAllUpVoiceFiles();
+      isMixing = false;
+      return;
+    }
+
+    // 複数ファイルをFFmpegでミックス
+    const inputArgs = [];
+    files.forEach(f => {
+      inputArgs.push("-i", f.path);
+    });
+
+    const filterComplex = `amix=inputs=${files.length}:duration=longest:dropout_transition=2`;
+
+    const ffmpegArgs = [
+      ...inputArgs,
+      "-filter_complex", filterComplex,
+      "-ac", "2",           // ステレオ
+      "-ar", "44100",       // サンプルレート
+      "-f", "webm",         // 出力フォーマット
+      "-c:a", "libopus",    // コーデック
+      outputPath
+    ];
+
+    const ffmpeg = spawn("ffmpeg", ffmpegArgs);
+
+    let stderrBuffer = '';
+
+    ffmpeg.stderr.on("data", (data) => {
+      const message = data.toString();
+      stderrBuffer += message;
+      if (message.includes('Error') || message.includes('error') || message.includes('Invalid')) {
+        console.error(`FFmpeg stderr: ${message}`);
+      }
+    });
+
+    await new Promise((resolve, reject) => {
+      ffmpeg.on("close", (code) => {
+        if (code === 0) {
+          console.log(`自動ミックス完了: ${outputFilename}`);
+          // upVoice内のファイルを削除
+          clearAllUpVoiceFiles();
+          resolve();
+        } else {
+          console.error(`FFmpeg 終了コード: ${code}`);
+          console.error(`FFmpeg stderr:\n${stderrBuffer}`);
+          reject(new Error(`FFmpeg処理が失敗しました (終了コード: ${code})`));
+        }
+      });
+
+      ffmpeg.on("error", (err) => {
+        console.error("FFmpeg 実行エラー:", err);
+        reject(err);
+      });
+    });
+
+  } catch (error) {
+    console.error("自動ミックス処理エラー:", error);
+    // エラー時も出力ファイルが中途半端に残っている場合は削除
+    if (fs.existsSync(outputPath)) {
+      try {
+        fs.unlinkSync(outputPath);
+        console.log("エラー時の不完全ファイルを削除しました");
+      } catch (unlinkErr) {
+        console.error("不完全ファイルの削除に失敗:", unlinkErr);
+      }
+    }
+  } finally {
+    isMixing = false;
+  }
 }
 
 // ====== API エンドポイント ======
@@ -168,6 +326,16 @@ app.post("/upload", upload.single("audio"), async (req, res) => {
     // ファイル数上限チェック・削除
     enforceFileLimit();
 
+    // ファイル数を確認して初回アップロード時は即座にamix実行
+    const files = getUpVoiceFiles();
+    
+    // 初回アップロード（1ファイルのみ）の場合は即座にミックス実行
+    if (files.length === 1) {
+      console.log('初回アップロード検出 - 即座にミックス実行');
+      // 非同期で実行（レスポンスをブロックしない）
+      queueMicrotask(() => performAutoMix());
+    }
+
     res.status(200).json({ 
       ok: true, 
       filename: req.file.filename 
@@ -180,170 +348,74 @@ app.post("/upload", upload.single("audio"), async (req, res) => {
 
 /**
  * GET /mix
- * 候補音声を FFmpeg amix でミックスして返却
- * 返却後、upVoice 内を全削除
+ * mixedVoice から最新のミックス音声を返却
  */
 app.get("/mix", async (req, res) => {
-  // ロック確認（同時実行防止）
-  if (isMixing) {
-    return res.status(429).json({ ok: false, error: "現在ミックス処理中です。しばらくお待ちください。" });
-  }
-
-  const files = getUpVoiceFiles();
-  
-  if (files.length === 0) {
-    return res.status(404).json({ ok: false, error: "ミックスする音声がありません" });
-  }
-
-  // 古い順に最大10件取得
-  const targetFiles = files.slice(0, MIX_CANDIDATE_COUNT);
-  
-  if (targetFiles.length === 1) {
-    // ファイルが1つの場合はそのまま返却
-    try {
-      isMixing = true;
-      res.setHeader("Content-Type", "audio/webm");
-      res.setHeader("Content-Disposition", "attachment; filename=mixed.webm");
-      
-      const stream = fs.createReadStream(targetFiles[0].path);
-      stream.pipe(res);
-      
-      stream.on("end", () => {
-        clearAllUpVoiceFiles();
-        isMixing = false;
-      });
-      
-      stream.on("error", (err) => {
-        console.error("ストリームエラー:", err);
-        isMixing = false;
-      });
-    } catch (error) {
-      console.error("単一ファイル返却エラー:", error);
-      isMixing = false;
-      res.status(500).json({ ok: false, error: "ファイル返却中にエラーが発生しました" });
-    }
-    return;
-  }
-
-  // 複数ファイルをミックス
-  isMixing = true;
-  
-  // stderrをバッファに保存（エラー時に出力するため）
-  let stderrBuffer = '';
-
   try {
-    // FFmpeg amix コマンド構築
-    const inputArgs = [];
-    targetFiles.forEach(f => {
-      inputArgs.push("-i", f.path);
-    });
+    const mixedFiles = getMixedVoiceFiles();
+    
+    if (mixedFiles.length === 0) {
+      return res.status(404).json({ ok: false, error: "ミックス音声がありません" });
+    }
 
-    const filterComplex = `amix=inputs=${targetFiles.length}:duration=longest:dropout_transition=2`;
-
-    const ffmpegArgs = [
-      ...inputArgs,
-      "-filter_complex", filterComplex,
-      "-ac", "2",           // ステレオ
-      "-ar", "44100",       // サンプルレート
-      "-f", "webm",         // 出力フォーマット
-      "-c:a", "libopus",    // コーデック
-      "pipe:1"              // stdout に出力
-    ];
-
-    console.log(`FFmpeg amix 開始: ${targetFiles.length}件`);
-
-    const ffmpeg = spawn("ffmpeg", ffmpegArgs);
-
-    // FFmpegのstderrをログに出力（エラー原因を確認するため）
-    ffmpeg.stderr.on("data", (data) => {
-      const message = data.toString();
-      stderrBuffer += message;
-      // エラーメッセージをログに出力
-      if (message.includes('Error') || message.includes('error') || message.includes('Invalid')) {
-        console.error(`FFmpeg stderr: ${message}`);
-      }
-    });
-
-    // ストリームのエラーハンドリング
-    ffmpeg.stdout.on("error", (err) => {
-      console.error("FFmpeg stdout エラー:", err);
-      if (!res.headersSent) {
-        res.status(500).json({ ok: false, error: "ストリームエラーが発生しました" });
-      } else {
-        res.destroy(); // 既にヘッダーが送られている場合はストリームを破棄
-      }
-      isMixing = false;
-    });
-
-    res.on("error", (err) => {
-      console.error("レスポンスストリームエラー:", err);
-      isMixing = false;
-    });
-
-    // ヘッダーを設定（パイプ前に設定）
+    // 最新のミックス音声を取得
+    const latestMixed = mixedFiles[0];
+    
+    console.log(`ミックス音声配信: ${latestMixed.name}`);
+    
+    // ファイルサイズを取得
+    const stats = fs.statSync(latestMixed.path);
+    const fileSizeMB = (stats.size / 1024 / 1024).toFixed(2);
+    console.log(`ファイルサイズ: ${fileSizeMB}MB`);
+    
+    // ヘッダーを設定
     res.setHeader("Content-Type", "audio/webm");
     res.setHeader("Content-Disposition", "attachment; filename=mixed.webm");
-
-    // FFmpeg stdout をレスポンスにパイプ
-    ffmpeg.stdout.pipe(res);
-
-    ffmpeg.on("close", (code) => {
-      if (code === 0) {
-        console.log("FFmpeg amix 完了");
-        // ミックス成功後、全ファイル削除
-        clearAllUpVoiceFiles();
-      } else {
-        console.error(`FFmpeg 終了コード: ${code}`);
-        console.error(`FFmpeg stderr 全体:\n${stderrBuffer}`);
-        
-        // エラー時はレスポンスを適切に終了
-        if (!res.headersSent) {
-          res.status(500).json({ 
-            ok: false, 
-            error: `FFmpeg処理が失敗しました (終了コード: ${code})`,
-            details: stderrBuffer
-          });
-        } else {
-          // 既にヘッダーが送られている場合は、ストリームを破棄
-          res.destroy();
-        }
-      }
-      isMixing = false;
-    });
-
-    ffmpeg.on("error", (err) => {
-      console.error("FFmpeg 実行エラー:", err);
-      console.error(`FFmpeg stderr 全体:\n${stderrBuffer}`);
-      isMixing = false;
+    res.setHeader("Content-Length", stats.size);
+    
+    // ファイルをストリーミング
+    const stream = fs.createReadStream(latestMixed.path);
+    
+    stream.on("error", (err) => {
+      console.error("ストリームエラー:", err);
       if (!res.headersSent) {
-        res.status(500).json({ ok: false, error: "FFmpeg 実行中にエラーが発生しました" });
+        res.status(500).json({ ok: false, error: "ファイル読み込みエラー" });
       } else {
         res.destroy();
       }
     });
-
+    
+    stream.pipe(res);
+    
   } catch (error) {
-    console.error("ミックス処理エラー:", error);
-    isMixing = false;
+    console.error("ミックス音声配信エラー:", error);
     if (!res.headersSent) {
-      res.status(500).json({ ok: false, error: "ミックス処理中にエラーが発生しました" });
+      res.status(500).json({ ok: false, error: "ミックス音声の配信中にエラーが発生しました" });
     }
   }
 });
 
 /**
  * GET /status
- * デバッグ用：upVoice の状態を返す
+ * デバッグ用：サーバーの状態を返す
  */
 app.get("/status", (req, res) => {
-  const files = getUpVoiceFiles();
+  const upVoiceFiles = getUpVoiceFiles();
+  const mixedFiles = getMixedVoiceFiles();
   res.json({
     ok: true,
-    totalFiles: files.length,
-    candidateCount: mixCandidates.length,
-    isMixing,
-    files: files.map(f => f.name),
-    candidates: mixCandidates.map(f => f.name)
+    upVoice: {
+      totalFiles: upVoiceFiles.length,
+      files: upVoiceFiles.map(f => f.name)
+    },
+    mixedVoice: {
+      totalFiles: mixedFiles.length,
+      files: mixedFiles.map(f => ({
+        name: f.name,
+        age: Math.floor((Date.now() - f.timestamp) / 60000) + "分"
+      }))
+    },
+    isMixing
   });
 });
 
@@ -358,27 +430,33 @@ app.delete("/clear", (req, res) => {
 
 // ====== スケジュールタスク ======
 
-// 25分おきに再生候補を更新
-// テストの為２分に変更！
-cron.schedule("*/5 * * * *", () => {
-  console.log("=== 2分おきスキャン実行 ===");
-  updateMixCandidates();
+// 10分ごとに自動ミックス実行
+cron.schedule("*/10 * * * *", async () => {
+  console.log("=== 10分ごとの自動ミックス実行 ===");
+  await performAutoMix();
 });
 
-// 毎日6時に upVoice 内を全削除（保険）
+// 30分ごとに古いミックス音声を削除
+cron.schedule("*/30 * * * *", () => {
+  console.log("=== 30分ごとのミックス音声クリーンアップ実行 ===");
+  cleanupOldMixedFiles();
+});
+
+// 毎日6時に全削除（保険）
 cron.schedule("0 6 * * *", () => {
   console.log("=== 毎日6時の全削除実行 ===");
   clearAllUpVoiceFiles();
+  cleanupOldMixedFiles();
 });
 
 // ====== サーバー起動 ======
 app.listen(PORT, () => {
   console.log(`🎙️ 録音サーバー起動: http://localhost:${PORT}`);
   console.log(`📁 upVoice ディレクトリ: ${UPVOICE_DIR}`);
-  console.log(`📊 ファイル上限: ${MAX_FILES}件`);
-  console.log(`🔀 ミックス対象: 最大${MIX_CANDIDATE_COUNT}件`);
-  console.log("====テストの為5分おきに再生=======");
-  
-  // 起動時に候補を更新
-  updateMixCandidates();
+  console.log(`📁 mixedVoice ディレクトリ: ${MIXED_VOICE_DIR}`);
+  console.log(`📊 upVoice上限: ${MAX_FILES}件`);
+  console.log(`🎵 ミックス音声保持: 最大${MAX_MIXED_FILES}件`);
+  console.log(`⏰ 自動ミックス: 10分ごと + 初回即座実行`);
+  console.log(`🧹 クリーンアップ: 30分ごと（${MIXED_FILE_LIFETIME / 60000}分経過で削除）`);
+  console.log("==========================================");
 });
